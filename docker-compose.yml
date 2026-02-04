@@ -1,0 +1,170 @@
+version: '3.8'
+
+services:
+  # PostgreSQL - Scraper Database (Tier 1)
+  postgres:
+    image: postgres:15-alpine
+    container_name: realtor-postgres
+    environment:
+      - POSTGRES_DB=scraper_canada_realtor
+      - POSTGRES_USER=landomo
+      - POSTGRES_PASSWORD=${SCRAPER_DB_PASSWORD:-landomo123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U landomo"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Redis - Queue and caching
+  redis:
+    image: redis:7-alpine
+    container_name: realtor-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Coordinator - City-based discovery (runs every 12 hours)
+  coordinator-city:
+    build: .
+    container_name: realtor-coordinator-city
+    command: npm run coordinator
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SCRAPER_DB_HOST=postgres
+      - SCRAPER_DB_NAME=scraper_canada_realtor
+      - SCRAPER_DB_USER=landomo
+      - SCRAPER_DB_PASSWORD=${SCRAPER_DB_PASSWORD:-landomo123}
+      - LANDOMO_API_URL=${LANDOMO_API_URL}
+      - LANDOMO_API_KEY=${LANDOMO_API_KEY}
+      - TRANSACTION_TYPE=${TRANSACTION_TYPE:-2}
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: "no"  # Use external scheduler (cron, k8s CronJob, etc.)
+
+  # Coordinator - Geo grid discovery (runs every 24 hours)
+  coordinator-geo:
+    build: .
+    container_name: realtor-coordinator-geo
+    command: npm run coordinator:geo
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SCRAPER_DB_HOST=postgres
+      - SCRAPER_DB_NAME=scraper_canada_realtor
+      - SCRAPER_DB_USER=landomo
+      - SCRAPER_DB_PASSWORD=${SCRAPER_DB_PASSWORD:-landomo123}
+      - LANDOMO_API_URL=${LANDOMO_API_URL}
+      - LANDOMO_API_KEY=${LANDOMO_API_KEY}
+      - TRANSACTION_TYPE=${TRANSACTION_TYPE:-2}
+      - GRID_SIZE=${GRID_SIZE:-1.0}
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: "no"  # Use external scheduler
+
+  # Workers - Process details from queue (scale with replicas)
+  worker:
+    build: .
+    command: npm run worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SCRAPER_DB_HOST=postgres
+      - SCRAPER_DB_NAME=scraper_canada_realtor
+      - SCRAPER_DB_USER=landomo
+      - SCRAPER_DB_PASSWORD=${SCRAPER_DB_PASSWORD:-landomo123}
+      - LANDOMO_API_URL=${LANDOMO_API_URL}
+      - LANDOMO_API_KEY=${LANDOMO_API_KEY}
+      - TRANSACTION_TYPE=${TRANSACTION_TYPE:-2}
+      - REQUEST_DELAY_MS=${REQUEST_DELAY_MS:-3000}
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 3  # Run 3 workers in parallel
+    restart: unless-stopped
+
+  # Verifier Worker - Check missing properties
+  worker-verifier:
+    build: .
+    container_name: realtor-worker-verifier
+    command: npm run worker:verifier
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SCRAPER_DB_HOST=postgres
+      - SCRAPER_DB_NAME=scraper_canada_realtor
+      - SCRAPER_DB_USER=landomo
+      - SCRAPER_DB_PASSWORD=${SCRAPER_DB_PASSWORD:-landomo123}
+      - LANDOMO_API_URL=${LANDOMO_API_URL}
+      - LANDOMO_API_KEY=${LANDOMO_API_KEY}
+      - DEBUG=${DEBUG:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Metrics Server - Prometheus metrics
+  metrics:
+    build: .
+    container_name: realtor-metrics
+    command: npm run metrics
+    ports:
+      - "9090:9090"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SCRAPER_DB_HOST=postgres
+      - SCRAPER_DB_NAME=scraper_canada_realtor
+      - SCRAPER_DB_USER=landomo
+      - SCRAPER_DB_PASSWORD=${SCRAPER_DB_PASSWORD:-landomo123}
+      - METRICS_PORT=9090
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Queue Stats Monitor (optional)
+  stats:
+    build: .
+    container_name: realtor-stats
+    command: npm run queue:stats
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - tools  # Only run when explicitly requested
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  default:
+    name: realtor-network
